@@ -21,31 +21,68 @@ class CoreTaxConverter:
         self.ppn_rate = 0.12  # 12% PPN rate
         
     def clean_numeric_value(self, value):
-        """Clean and convert string numbers to float"""
-        if pd.isna(value) or value == '':
+        """Clean and convert string numbers to float, ensuring no NaN values"""
+        # Handle None, NaN, empty string, or missing values
+        if value is None or pd.isna(value) or value == '' or value == 'NaN':
             return 0.0
+            
+        # Handle numpy NaN or Python float NaN
+        if isinstance(value, float) and (value != value or str(value).lower() == 'nan'):  # NaN != NaN is True
+            return 0.0
+            
         if isinstance(value, str):
+            # Check for string 'nan' or 'NaN'
+            if value.lower().strip() == 'nan':
+                return 0.0
             # Remove any non-numeric characters except decimal points
             cleaned = re.sub(r'[^\d.-]', '', str(value))
-            try:
-                return float(cleaned) if cleaned else 0.0
-            except ValueError:
+            if not cleaned or cleaned == '-' or cleaned == '.':
                 return 0.0
-        return float(value) if value else 0.0
+            try:
+                result = float(cleaned)
+                # Double-check result is not NaN
+                return result if not (result != result) else 0.0
+            except (ValueError, OverflowError):
+                return 0.0
+                
+        try:
+            result = float(value) if value else 0.0
+            # Ensure result is not NaN or infinity
+            if result != result or result == float('inf') or result == float('-inf'):
+                return 0.0
+            return result
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
     
     def calculate_dpp_and_ppn(self, price_after_tax):
-        """Calculate DPP and PPN from price after tax"""
-        if price_after_tax <= 0:
+        """Calculate DPP and PPN from price after tax, ensuring no NaN values"""
+        try:
+            # Clean the input value first
+            price_after_tax = self.clean_numeric_value(price_after_tax)
+            
+            if price_after_tax <= 0:
+                return 0.0, 0.0
+            
+            # DPP = Price After Tax / (1 + PPN Rate)
+            denominator = 1 + self.ppn_rate
+            if denominator == 0:  # Safety check (should never happen)
+                return 0.0, 0.0
+                
+            dpp = price_after_tax / denominator
+            ppn = dpp * self.ppn_rate
+            
+            # Ensure results are valid numbers
+            dpp = dpp if (dpp == dpp and dpp != float('inf') and dpp != float('-inf')) else 0.0
+            ppn = ppn if (ppn == ppn and ppn != float('inf') and ppn != float('-inf')) else 0.0
+            
+            return round(dpp, 2), round(ppn, 2)
+            
+        except (ValueError, TypeError, ZeroDivisionError, OverflowError) as e:
+            logger.error(f"Error in DPP/PPN calculation: {e}")
             return 0.0, 0.0
-        
-        # DPP = Price After Tax / (1 + PPN Rate)
-        dpp = price_after_tax / (1 + self.ppn_rate)
-        ppn = dpp * self.ppn_rate
-        
-        return round(dpp, 2), round(ppn, 2)
     
     def process_sales_data(self, sales_df):
-        """Process sales data and convert to Core Tax format"""
+        """Process sales data and convert to Core Tax format with NaN prevention"""
         logger.info(f"Processing {len(sales_df)} sales records")
         
         # Clean column names
@@ -55,7 +92,7 @@ class CoreTaxConverter:
         
         for idx, row in sales_df.iterrows():
             try:
-                # Extract basic info
+                # Extract and clean basic info
                 customer_code = str(row.get('CustomerCode', '')).strip()
                 customer_name = str(row.get('CustomerName', '')).strip()
                 invoice_no = str(row.get('InvoiceNo', '')).strip()
@@ -63,54 +100,114 @@ class CoreTaxConverter:
                 item_code = str(row.get('ItemCode', '')).strip()
                 item_name = str(row.get('ItemName', '')).strip()
                 
-                # Handle quantity and pricing
+                # Handle quantity and pricing with NaN prevention
                 qty = self.clean_numeric_value(row.get('Qty', 0))
                 price_after_tax = self.clean_numeric_value(row.get('PriceAfterTax', 0))
                 invoice_amount = self.clean_numeric_value(row.get('InvoiceAmount', 0))
                 
-                # Use invoice amount if available, otherwise use price after tax
-                total_amount = invoice_amount if invoice_amount > 0 else price_after_tax
+                # Ensure minimum values to prevent division by zero
+                qty = max(qty, 1)  # Minimum quantity of 1
                 
-                # Calculate unit price
+                # Use invoice amount if available and valid, otherwise use price after tax
+                total_amount = invoice_amount if invoice_amount > 0 else price_after_tax
+                total_amount = max(total_amount, 0)  # Ensure non-negative
+                
+                # Calculate unit price with zero-division protection
                 unit_price = (total_amount / qty) if qty > 0 else 0
                 
                 # Calculate DPP and PPN
                 dpp_total, ppn_total = self.calculate_dpp_and_ppn(total_amount)
-                dpp_unit = dpp_total / qty if qty > 0 else 0
+                dpp_unit = (dpp_total / qty) if qty > 0 else 0
                 
                 # Format invoice date
                 formatted_date = self.format_date(invoice_date)
                 
+                # Create record with all NaN-safe values
                 record = {
                     'baris': idx + 1,
                     'barang_jasa': 'A',  # Default to 'A' for goods
                     'kode_barang_jasa': item_code[:20] if item_code else '310000',  # Default code
                     'nama_barang_jasa': item_name[:255] if item_name else 'Barang/Jasa',
                     'nama_satuan_ukur': 'UM.0003',  # Default unit
-                    'harga_satuan': round(dpp_unit, 2),
+                    'harga_satuan': self.safe_round(dpp_unit, 2),
                     'jumlah_barang_jasa': int(qty) if qty > 0 else 1,
                     'total_diskon': 0.0,
-                    'dpp': round(dpp_total, 2),
-                    'dpp_nilai_lain': round(dpp_total, 2),
+                    'dpp': self.safe_round(dpp_total, 2),
+                    'dpp_nilai_lain': self.safe_round(dpp_total, 2),
                     'tarif_ppn': 12,
-                    'ppn': round(ppn_total, 2),
+                    'ppn': self.safe_round(ppn_total, 2),
                     'tarif_ppnbm': 0,
                     'ppnbm': 0.0,
                     'customer_code': customer_code,
                     'customer_name': customer_name,
                     'invoice_no': invoice_no,
                     'invoice_date': formatted_date,
-                    'total_amount': round(total_amount, 2)
+                    'total_amount': self.safe_round(total_amount, 2)
                 }
                 
-                processed_data.append(record)
+                # Final validation - ensure no field contains NaN
+                validated_record = self.validate_record(record)
+                processed_data.append(validated_record)
                 
             except Exception as e:
                 logger.error(f"Error processing row {idx}: {str(e)}")
+                # Create a minimal valid record to prevent data loss
+                fallback_record = self.create_fallback_record(idx + 1)
+                processed_data.append(fallback_record)
                 continue
         
         logger.info(f"Successfully processed {len(processed_data)} records")
         return processed_data
+    
+    def safe_round(self, value, decimals=2):
+        """Safely round a number, handling NaN and infinity"""
+        try:
+            if value is None or value != value or value == float('inf') or value == float('-inf'):
+                return 0.0
+            return round(float(value), decimals)
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
+    
+    def validate_record(self, record):
+        """Validate and clean a record to ensure no NaN values"""
+        validated = {}
+        for key, value in record.items():
+            if isinstance(value, (int, float)):
+                # Check for NaN, infinity, or invalid numbers
+                if value != value or value == float('inf') or value == float('-inf'):
+                    validated[key] = 0.0 if key in ['harga_satuan', 'dpp', 'dpp_nilai_lain', 'ppn', 'ppnbm', 'total_diskon', 'total_amount'] else 0
+                else:
+                    validated[key] = value
+            elif isinstance(value, str):
+                # Ensure no 'NaN' strings
+                validated[key] = value if value.lower() != 'nan' else ''
+            else:
+                validated[key] = value
+        return validated
+    
+    def create_fallback_record(self, row_number):
+        """Create a minimal valid record as fallback"""
+        return {
+            'baris': row_number,
+            'barang_jasa': 'A',
+            'kode_barang_jasa': '310000',
+            'nama_barang_jasa': 'Data Error - Manual Review Required',
+            'nama_satuan_ukur': 'UM.0003',
+            'harga_satuan': 0.0,
+            'jumlah_barang_jasa': 1,
+            'total_diskon': 0.0,
+            'dpp': 0.0,
+            'dpp_nilai_lain': 0.0,
+            'tarif_ppn': 12,
+            'ppn': 0.0,
+            'tarif_ppnbm': 0,
+            'ppnbm': 0.0,
+            'customer_code': '',
+            'customer_name': '',
+            'invoice_no': '',
+            'invoice_date': datetime.now().strftime('%Y-%m-%d'),
+            'total_amount': 0.0
+        }
     
     def format_date(self, date_value):
         """Format date to YYYY-MM-DD"""
@@ -169,7 +266,7 @@ class CoreTaxConverter:
             sheet[f'C{i}'] = 'Normal'
     
     def create_detail_faktur_sheet(self, sheet, processed_data):
-        """Create the DetailFaktur sheet with transaction data"""
+        """Create the DetailFaktur sheet with transaction data, ensuring no NaN values"""
         # Headers
         headers = [
             'Baris', 'Barang.Jasa', 'Kode Barang Jasa', 'Nama Barang.Jasa', 
@@ -181,22 +278,57 @@ class CoreTaxConverter:
         for col, header in enumerate(headers, 1):
             sheet.cell(row=1, column=col, value=header)
         
-        # Write data
+        # Write data with NaN prevention
         for row_idx, record in enumerate(processed_data, 2):
-            sheet.cell(row=row_idx, column=1, value=record['baris'])
-            sheet.cell(row=row_idx, column=2, value=record['barang_jasa'])
-            sheet.cell(row=row_idx, column=3, value=record['kode_barang_jasa'])
-            sheet.cell(row=row_idx, column=4, value=record['nama_barang_jasa'])
-            sheet.cell(row=row_idx, column=5, value=record['nama_satuan_ukur'])
-            sheet.cell(row=row_idx, column=6, value=record['harga_satuan'])
-            sheet.cell(row=row_idx, column=7, value=record['jumlah_barang_jasa'])
-            sheet.cell(row=row_idx, column=8, value=record['total_diskon'])
-            sheet.cell(row=row_idx, column=9, value=record['dpp'])
-            sheet.cell(row=row_idx, column=10, value=record['dpp_nilai_lain'])
-            sheet.cell(row=row_idx, column=11, value=record['tarif_ppn'])
-            sheet.cell(row=row_idx, column=12, value=record['ppn'])
-            sheet.cell(row=row_idx, column=13, value=record['tarif_ppnbm'])
-            sheet.cell(row=row_idx, column=14, value=record['ppnbm'])
+            try:
+                # Write each cell with validation
+                self.safe_write_cell(sheet, row_idx, 1, record['baris'])
+                self.safe_write_cell(sheet, row_idx, 2, record['barang_jasa'])
+                self.safe_write_cell(sheet, row_idx, 3, record['kode_barang_jasa'])
+                self.safe_write_cell(sheet, row_idx, 4, record['nama_barang_jasa'])
+                self.safe_write_cell(sheet, row_idx, 5, record['nama_satuan_ukur'])
+                self.safe_write_cell(sheet, row_idx, 6, record['harga_satuan'])
+                self.safe_write_cell(sheet, row_idx, 7, record['jumlah_barang_jasa'])
+                self.safe_write_cell(sheet, row_idx, 8, record['total_diskon'])
+                self.safe_write_cell(sheet, row_idx, 9, record['dpp'])
+                self.safe_write_cell(sheet, row_idx, 10, record['dpp_nilai_lain'])
+                self.safe_write_cell(sheet, row_idx, 11, record['tarif_ppn'])
+                self.safe_write_cell(sheet, row_idx, 12, record['ppn'])
+                self.safe_write_cell(sheet, row_idx, 13, record['tarif_ppnbm'])
+                self.safe_write_cell(sheet, row_idx, 14, record['ppnbm'])
+                
+            except Exception as e:
+                logger.error(f"Error writing row {row_idx}: {str(e)}")
+                # Write fallback values for this row
+                for col in range(1, 15):
+                    fallback_value = 0 if col in [6, 8, 9, 10, 12, 14] else (1 if col == 7 else ('A' if col == 2 else ''))
+                    self.safe_write_cell(sheet, row_idx, col, fallback_value)
+    
+    def safe_write_cell(self, sheet, row, col, value):
+        """Safely write a value to a cell, preventing NaN values"""
+        try:
+            # Handle different value types
+            if isinstance(value, (int, float)):
+                # Check for NaN, infinity, or invalid numbers
+                if value != value or value == float('inf') or value == float('-inf'):
+                    safe_value = 0
+                else:
+                    safe_value = value
+            elif isinstance(value, str):
+                # Check for 'NaN' strings
+                safe_value = value if value.lower() != 'nan' else ''
+            elif value is None:
+                safe_value = 0 if col in [6, 8, 9, 10, 12, 14] else ''  # Numeric columns get 0, text get empty
+            else:
+                safe_value = value
+            
+            sheet.cell(row=row, column=col, value=safe_value)
+            
+        except Exception as e:
+            logger.error(f"Error writing cell ({row}, {col}): {str(e)}")
+            # Write a safe fallback value
+            fallback_value = 0 if col in [1, 6, 7, 8, 9, 10, 11, 12, 13, 14] else ''
+            sheet.cell(row=row, column=col, value=fallback_value)
     
     def create_ref_sheet(self, sheet):
         """Create reference sheet"""
