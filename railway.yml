@@ -1,7 +1,11 @@
+version: 2
 deploy:
   startCommand: python main.py
   healthcheckPath: /health
   healthcheckTimeout: 300
+  restartPolicyType: never
 
 build:
   buildCommand: pip install --no-cache-dir -r requirements.txt
+  watchPatterns:
+    - "**/*.py"
